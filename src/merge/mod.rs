@@ -8,6 +8,17 @@ use crate::wire::{clean_to_wireframe_allow_conflicts, smudge_from_wireframe};
 
 /// Maximum interior DP matrix cells (`4M` = `~32 MiB`) before skipping full LCS recovery.
 pub const MAX_LCS_CELLS: usize = 4_000_000;
+pub const MAX_TEXT_LINES: usize = 100_000;
+
+/// Bound line metadata before allocating a merge or diff.
+pub fn check_text_budget(text: &str) -> Result<()> {
+    if text.split_inclusive('\n').take(MAX_TEXT_LINES + 1).count() > MAX_TEXT_LINES {
+        return Err(anyhow!(
+            "Vellum text operation exceeds {MAX_TEXT_LINES} lines"
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Hunk {
@@ -290,20 +301,15 @@ pub fn merge_encrypted_wireframes(
     let ours_pt = smudge_from_wireframe(subkeys, rel_path, ours_wire)?;
     let theirs_pt = smudge_from_wireframe(subkeys, rel_path, theirs_wire)?;
 
-    let base_str = Zeroizing::new(
-        String::from_utf8(base_pt.to_vec())
-            .map_err(|_| anyhow!("3-way merge requires UTF-8 text on '{rel_path}'"))?,
-    );
-    let ours_str = Zeroizing::new(
-        String::from_utf8(ours_pt.to_vec())
-            .map_err(|_| anyhow!("3-way merge requires UTF-8 text on '{rel_path}'"))?,
-    );
-    let theirs_str = Zeroizing::new(
-        String::from_utf8(theirs_pt.to_vec())
-            .map_err(|_| anyhow!("3-way merge requires UTF-8 text on '{rel_path}'"))?,
-    );
-
-    let (merged, has_conflict) = merge_three_way_lines(&base_str, &ours_str, &theirs_str);
+    let [base, ours, theirs] = [&base_pt, &ours_pt, &theirs_pt].map(|bytes| {
+        std::str::from_utf8(bytes)
+            .map_err(|_| anyhow!("3-way merge requires UTF-8 text"))
+            .and_then(|text| {
+                check_text_budget(text)?;
+                Ok(text)
+            })
+    });
+    let (merged, has_conflict) = merge_three_way_lines(base?, ours?, theirs?);
     let merged_zero = Zeroizing::new(merged);
     let sealed =
         clean_to_wireframe_allow_conflicts(subkeys, rel_path, merged_zero.as_bytes(), None)?;

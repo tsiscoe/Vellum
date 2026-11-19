@@ -26,7 +26,7 @@ flowchart LR
     SIV -->|"Ordered Chunk Manifest\n+ Keyed BLAKE3 Seal"| Wire["VELLUM-WIRE-V1 Text Blob\n(@vellum:header / chunk / seal)"]
     Wire -->|"git push (95%+ Unchanged Chunks)"| Remote[("GitHub / Untrusted Remote\nZero Plaintext Ever Stored")]
     Wire -->|"git merge (%O %A %B %P)"| Merge["Zero-Disk In-RAM LCS 3-Way Merge\n(Zeroizing Buffers -> Re-Seal)"]
-    Wire -->|"git smudge / textconv\n(Verify Seal BEFORE Decrypt)"| Plain
+    Wire -->|"git smudge\n(Verify Seal BEFORE Decrypt)"| Plain
 ```
 
 ---
@@ -39,7 +39,7 @@ flowchart LR
 | **Key Hierarchy** | `RepoMasterKey` (`32B`) + `HKDF-SHA256` | Expands domain-separated 256-bit keys: `cdc_key`, `siv_key`, `enc_key`, `seal_key`. |
 | **Convergent Chunk AEAD** | `BLAKE3` Keyed SIV + `XChaCha20-Poly1305` (192-bit nonce) | Binds both chunk SIV and `AAD` to `normalized_rel_path`; decrypt verifies plaintext recomputes the exact wire nonce and `chunk_id`. |
 | **Merkle File Seal** | `@vellum:seal:v1` (`BLAKE3` keyed MAC) + `path_mac` | Commits to normalized path, chunker mode, chunk count, and ordered chunk digests—defeating block reordering, deletion, and cross-file swaps. |
-| **Custody Vault (`vellum.db`)** | `Argon2id` (`64 MiB, t=3, p=4`) + `XChaCha20-Poly1305` + `rusqlite 0.42.0` | Encrypts scoped repo keys and every `seal_audit_log` path/metric row inside `BEGIN IMMEDIATE` WAL (`PRAGMA secure_delete = ON`, fail-closed `icacls` / `0600`). |
+| **Custody Vault (`vellum.db`)** | `Argon2id` (`64 MiB, t=3, p=4`) + `XChaCha20-Poly1305` + `rusqlite 0.42.0` | Authenticates scoped keys and audit records in a verified owner-only directory. Audit writes use immediate SQLite transactions and full WAL synchronization. |
 | **Terminal Sanitization** | `sanitize_terminal_str` (`CWE-150`) | Strips C0/C1 control bytes and ANSI/OSC escape sequences before rendering repository paths inside `vellum tui`. |
 
 ---
@@ -51,33 +51,33 @@ flowchart LR
 ```bash
 git clone https://github.com/tsiscoe/Vellum.git
 cd Vellum
-cargo build --release
+cargo build --locked --release
 ```
 
 ### 2. Initialize Your Scoped Vault (`vellum init`)
 
 ```bash
 # Initialize Your Scoped Vault (raw key redacted on stdout unless --reveal is passed)
-vellum --keyring init --scope default --export-key ./vellum-default.key
+vellum --keyring init --scope default
 
 # Print exact .gitattributes and .git/config wiring (strict [A-Za-z0-9_-] scope validation)
-vellum git-config --scope default
+vellum --keyring git-config --scope default
 ```
 
 ### 3. Clean, Smudge, Diff & 3-Way Merge (`clean` / `smudge` / `diff` / `merge`)
 
 ```bash
 # Clean a plaintext file into Merkle-sealed VELLUM-WIRE-V1 (idempotent if already sealed)
-vellum clean --path docs/spec.md --key ./vellum-default.key -i ./spec.md -o ./spec.vellum
+vellum --keyring clean --path docs/spec.md -i ./spec.md -o ./spec.vellum
 
 # Inspect chunk reuse & decrypted unified diff strictly in memory
-vellum diff ./spec-v1.vellum ./spec-v2.vellum --path docs/spec.md --key ./vellum-default.key
+vellum --keyring diff ./spec-v1.vellum ./spec-v2.vellum --path docs/spec.md
 
 # Zero-disk in-RAM 3-way merge (compatible with Git %O %A %B %P merge drivers)
-vellum merge --base ./base.vellum --ours ./ours.vellum --theirs ./theirs.vellum --path docs/spec.md --key ./vellum-default.key
+vellum --keyring merge --base ./base.vellum --ours ./ours.vellum --theirs ./theirs.vellum --path docs/spec.md
 
-# Verify every VELLUM-WIRE-V1 seal across a directory tree
-vellum verify-tree --dir . --key ./vellum-default.key
+# Verify protected staged objects against your independently maintained path manifest
+vellum --keyring verify-tree --staged --manifest /trusted/protected-paths.json
 
 # Inspect scoped keys, wireframe chunks, and Merkle audit log in Ratatui
 vellum --keyring tui --file ./spec.vellum
@@ -89,9 +89,11 @@ vellum --keyring tui --file ./spec.vellum
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 ```
+
+Convergence exposes repetition and chunk sizes in encrypted history. Git checkout writes plaintext to the worktree, and plaintext comparison writes it to the selected output. Protect local worktrees, process dumps and terminal output accordingly. See [the installation guide](INSTALL.md) for the trusted Git manifest, upgrade behavior, and external audit checkpoints.
 
 ---
 

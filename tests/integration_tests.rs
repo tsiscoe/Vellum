@@ -112,11 +112,11 @@ fn test_merkle_seal_rejects_chunk_reordering_deletion_truncation_and_path_swap()
     // 4. Wrong key -> rejected
     assert!(smudge_from_wireframe(&wrong_subkeys, "specs/protocol.md", &wire).is_err());
 
-    // 5. Path normalization parity across Windows backslash and POSIX `./` prefix
-    let restored = smudge_from_wireframe(&subkeys, r".\specs\protocol.md", &wire).unwrap();
+    // 5. The V1 wireframe still opens under its canonical Git path.
+    let restored = smudge_from_wireframe(&subkeys, "specs/protocol.md", &wire).unwrap();
     assert_eq!(restored.as_slice(), doc.as_bytes());
     assert_eq!(
-        normalize_repo_path(r"./specs\protocol.md"),
+        normalize_repo_path("specs/protocol.md"),
         "specs/protocol.md"
     );
 
@@ -387,8 +387,9 @@ fn test_tier5_red_team_hardening_invariants() {
     assert!(validate_and_normalize_repo_path("docs/../../etc/passwd").is_err());
     assert!(validate_and_normalize_repo_path("C:secret.md").is_err());
     assert!(validate_and_normalize_repo_path("bad\0path.md").is_err());
+    assert!(validate_and_normalize_repo_path(r".\docs//./arch.md").is_err());
     assert_eq!(
-        validate_and_normalize_repo_path(r".\docs//./arch.md").unwrap(),
+        validate_and_normalize_repo_path("docs/arch.md").unwrap(),
         "docs/arch.md"
     );
 

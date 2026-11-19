@@ -58,7 +58,8 @@ When Git encounters divergent encrypted commits on `Ours` (`%A`) and `Theirs` (`
 
 - Uses bundled `rusqlite 0.42.0` in WAL mode with `PRAGMA secure_delete = ON` and `BEGIN IMMEDIATE` serialization (`CWE-362`).
 - Encrypts scoped `RepoMasterKey` entries (`repo_scopes`) and `seal_audit_log` payloads (`scope`, `rel_path`, `total_chunks`, `unchanged_chunks`, `seal_short`) using `Argon2id` (`64 MiB, t=3, p=4`) + `XChaCha20-Poly1305` so zero file paths sit in plaintext inside `vellum.db`.
-- Links every audit event into a tamper-evident `BLAKE3` Merkle chain (`verify_audit_chain`) and enforces owner-only ACLs (`icacls /inheritance:r` on Windows, `0700`/`0600` on Unix).
+- Links audit records into a `BLAKE3` chain. Vault-backed operations write intent before output and write an outcome after output. A separately retained checkpoint lets verification detect loss of history through the checkpoint.
+- Verifies owner-only permissions on the dedicated vault directory and managed files. Export builds a protected file before writing the key and publishes it without clobbering an existing path.
 
 ---
 

@@ -70,48 +70,25 @@ pub fn validate_scope_name(scope: &str) -> Result<()> {
     Ok(())
 }
 
-/// Strictly canonicalize and validate a repository-relative path before binding it into
-/// `BLAKE3-XChaCha20-SIV` keys, AAD, or Merkle seals (`CWE-22`).
-///
-/// Rejects empty paths, ASCII control bytes, Windows drive colons (`:`), and `..` traversal
-/// segments while collapsing duplicate `/` and `.` segments deterministically.
+/// Validate the canonical, UTF-8 Git path before binding it to cryptographic data.
+/// Reject spellings V1 formerly normalized to another path.
 pub fn validate_and_normalize_repo_path(rel_path: &str) -> Result<String> {
-    let trimmed = rel_path.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("repository path cannot be empty"));
-    }
-    if trimmed.chars().any(char::is_control) {
+    if rel_path != rel_path.trim()
+        || rel_path.contains([':', '\\'])
+        || rel_path.chars().any(char::is_control)
+        || rel_path
+            .split('/')
+            .any(|part| matches!(part, "" | "." | ".."))
+    {
         return Err(anyhow!(
-            "repository path contains illegal control characters"
+            "expected a canonical Git-relative path with '/' separators"
         ));
     }
-    if trimmed.contains(':') {
-        return Err(anyhow!(
-            "repository path '{trimmed}' cannot contain drive or stream colons"
-        ));
-    }
-
-    let mut segments = Vec::new();
-    for seg in trimmed.split(['/', '\\']) {
-        match seg {
-            "" | "." => continue,
-            ".." => {
-                return Err(anyhow!(
-                    "parent traversal ('..') is forbidden in repository path '{trimmed}'"
-                ));
-            }
-            s => segments.push(s),
-        }
-    }
-
-    if segments.is_empty() {
-        return Err(anyhow!("repository path '{trimmed}' resolves to empty"));
-    }
-    Ok(segments.join("/"))
+    Ok(rel_path.to_owned())
 }
 
-/// Canonicalize repository-relative paths (`\` -> `/`, collapse empty & `.` segments) for display
-/// helpers where fallible errors are omitted. Cryptographic paths MUST use
+/// Validate repository-relative paths for display helpers where fallible errors are omitted.
+/// Cryptographic paths MUST use
 /// [`validate_and_normalize_repo_path`].
 pub fn normalize_repo_path(rel_path: &str) -> String {
     validate_and_normalize_repo_path(rel_path).unwrap_or_else(|_| "untitled".to_string())
@@ -163,19 +140,20 @@ pub fn parse_repo_key(spec: &str) -> Result<RepoMasterKey> {
     let trimmed = spec.trim();
     let body = trimmed.strip_prefix("vellum-key-v1:").unwrap_or(trimmed);
 
-    let mut raw_vec = if body.len() == 64 && body.chars().all(|c| c.is_ascii_hexdigit()) {
-        hex::decode(body).map_err(|e| anyhow!("invalid hex repository key: {e}"))?
-    } else {
-        BASE64_STD
-            .decode(body)
-            .map_err(|e| anyhow!("invalid Base64 repository key: {e}"))?
-    };
+    let raw_vec = Zeroizing::new(
+        if body.len() == 64 && body.chars().all(|c| c.is_ascii_hexdigit()) {
+            hex::decode(body).map_err(|e| anyhow!("invalid hex repository key: {e}"))?
+        } else {
+            BASE64_STD
+                .decode(body)
+                .map_err(|e| anyhow!("invalid Base64 repository key: {e}"))?
+        },
+    );
 
     let arr: [u8; KEY_LEN] = raw_vec
-        .clone()
+        .as_slice()
         .try_into()
         .map_err(|_| anyhow!("repository key must decode to 32 bytes"))?;
-    raw_vec.zeroize();
     Ok(RepoMasterKey::from_bytes(arr))
 }
 
