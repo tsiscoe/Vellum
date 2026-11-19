@@ -17,10 +17,11 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::crypto::{
     MasterSeed, RepoMasterKey, SALT_LEN, VaultSubkeys, aead_decrypt, aead_encrypt, blake3_hash_hex,
-    constant_time_eq_32, generate_salt, keyed_blake3_hex, parse_repo_key,
+    constant_time_eq_32, generate_salt, keyed_blake3_hex, parse_repo_key, validate_scope_name,
 };
 
 pub const GENESIS_PREV_HASH: &str =
@@ -35,7 +36,7 @@ pub struct ScopeKeySummary {
 }
 
 /// Decrypted internal scope key record serialized inside `repo_scopes.ciphertext`.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct ScopedKeyPayload {
     scope: String,
     master_key_b64: String,
@@ -68,7 +69,7 @@ pub struct SealAuditEntry {
     pub entry_hash: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct EncryptedAuditBody {
     scope: String,
     rel_path: String,
@@ -257,8 +258,16 @@ impl VellumVault {
         &self.db_path
     }
 
+    /// Compute the 12-hex blind-indexed fingerprint of a `RepoMasterKey` without exposing raw bytes.
+    pub fn scope_fingerprint(&self, key: &RepoMasterKey) -> String {
+        let encoded = key.encode_key_b64();
+        keyed_blake3_hex(&self.subkeys.mac_key, "vellum-v1-fp", encoded.as_bytes())[..12]
+            .to_string()
+    }
+
     /// Retrieve an existing scope key or provision a fresh 256-bit `RepoMasterKey`.
     pub fn ensure_scope_key(&mut self, scope: &str) -> Result<RepoMasterKey> {
+        validate_scope_name(scope)?;
         if let Some(existing) = self.get_scope_key(scope)? {
             return Ok(existing);
         }
@@ -269,21 +278,20 @@ impl VellumVault {
 
     /// Store or rotate a scoped `RepoMasterKey` inside `BEGIN IMMEDIATE`.
     pub fn set_scope_key(&mut self, scope: &str, key: &RepoMasterKey) -> Result<()> {
+        validate_scope_name(scope)?;
         let scope_index =
             keyed_blake3_hex(&self.subkeys.mac_key, "vellum-v1-scope", scope.as_bytes());
         let aad_id = Uuid::new_v4().to_string();
         let created_at = Utc::now().to_rfc3339();
+        let encoded = key.encode_key_b64();
         let payload = ScopedKeyPayload {
             scope: scope.to_string(),
-            master_key_b64: key.encode_key_b64(),
+            master_key_b64: encoded.to_string(),
             created_at: created_at.clone(),
         };
+        let payload_json = Zeroizing::new(serde_json::to_vec(&payload)?);
         let aad = format!("vellum-v1|scope|{aad_id}");
-        let ct = aead_encrypt(
-            &self.subkeys.vault_key,
-            aad.as_bytes(),
-            &serde_json::to_vec(&payload)?,
-        )?;
+        let ct = aead_encrypt(&self.subkeys.vault_key, aad.as_bytes(), &payload_json)?;
 
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         tx.execute(
@@ -301,6 +309,7 @@ impl VellumVault {
 
     /// Retrieve a stored `RepoMasterKey` for `scope`.
     pub fn get_scope_key(&self, scope: &str) -> Result<Option<RepoMasterKey>> {
+        validate_scope_name(scope)?;
         let scope_index =
             keyed_blake3_hex(&self.subkeys.mac_key, "vellum-v1-scope", scope.as_bytes());
         let row: Option<(String, Vec<u8>)> = self
@@ -343,9 +352,9 @@ impl VellumVault {
             )[..12]
                 .to_string();
             out.push(ScopeKeySummary {
-                scope: payload.scope,
+                scope: payload.scope.clone(),
                 fingerprint: fp,
-                created_at: payload.created_at,
+                created_at: payload.created_at.clone(),
             });
         }
         Ok(out)
@@ -353,6 +362,7 @@ impl VellumVault {
 
     /// Append an encrypted, `BLAKE3` Merkle-chained operation event into `seal_audit_log`.
     pub fn append_audit_event(&mut self, event: NewAuditEvent) -> Result<SealAuditEntry> {
+        validate_scope_name(&event.scope)?;
         let timestamp = Utc::now().to_rfc3339();
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
@@ -383,15 +393,12 @@ impl VellumVault {
             unchanged_chunks: event.unchanged_chunks,
             seal_short: event.seal_short.clone(),
         };
+        let body_json = Zeroizing::new(serde_json::to_vec(&body)?);
         let aad = format!(
             "vellum-v1|audit|{prev_hash}|{timestamp}|{}",
             event.operation
         );
-        let ct = aead_encrypt(
-            &self.subkeys.vault_key,
-            aad.as_bytes(),
-            &serde_json::to_vec(&body)?,
-        )?;
+        let ct = aead_encrypt(&self.subkeys.vault_key, aad.as_bytes(), &body_json)?;
 
         tx.execute(
             "INSERT INTO seal_audit_log (timestamp, operation, prev_hash, entry_hash, ciphertext)
@@ -431,11 +438,11 @@ impl VellumVault {
             seq,
             timestamp,
             operation,
-            scope: body.scope,
-            rel_path: body.rel_path,
+            scope: body.scope.clone(),
+            rel_path: body.rel_path.clone(),
             total_chunks: body.total_chunks,
             unchanged_chunks: body.unchanged_chunks,
-            seal_short: body.seal_short,
+            seal_short: body.seal_short.clone(),
             prev_hash,
             entry_hash,
         })

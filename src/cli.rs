@@ -35,9 +35,13 @@ pub enum Commands {
         #[arg(long, default_value = "default")]
         scope: String,
 
-        /// Optional file path to export the `vellum-key-v1:...` key.
+        /// Optional file path to export the `vellum-key-v1:...` key with owner-only ACLs.
         #[arg(long)]
         export_key: Option<PathBuf>,
+
+        /// Reveal the raw `vellum-key-v1:...` key on stdout/JSON (redacted by default).
+        #[arg(long)]
+        reveal: bool,
     },
 
     /// Git clean filter: encrypt plaintext stdin/file into `VELLUM-WIRE-V1`.

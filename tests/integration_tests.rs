@@ -10,8 +10,8 @@ use tempfile::TempDir;
 
 use vellum::chunker::{ChunkMode, chunk_bytes, split_binary_cdc};
 use vellum::crypto::{
-    RepoMasterKey, normalize_repo_path, open_convergent_chunk, parse_repo_key,
-    seal_convergent_chunk,
+    RepoMasterKey, aead_decrypt, aead_encrypt, normalize_repo_path, open_convergent_chunk,
+    parse_repo_key, seal_convergent_chunk, validate_and_normalize_repo_path, validate_scope_name,
 };
 use vellum::merge::{merge_encrypted_wireframes, merge_three_way_lines, unified_diff_text};
 use vellum::tui::{
@@ -20,8 +20,8 @@ use vellum::tui::{
 };
 use vellum::vault::{NewAuditEvent, VellumVault, enforce_vault_and_sidecar_acls};
 use vellum::wire::{
-    clean_to_wireframe, diff_wireframes_stats, is_vellum_wireframe, parse_and_verify_wireframe,
-    smudge_from_wireframe,
+    clean_to_wireframe, clean_to_wireframe_allow_conflicts, diff_wireframes_stats,
+    is_vellum_wireframe, parse_and_verify_wireframe, smudge_from_wireframe,
 };
 
 proptest! {
@@ -338,4 +338,73 @@ fn test_ratatui_test_backend_snapshot_and_cwe150_ansi_sanitization() {
     assert!(rendered.contains("WIREFRAME CHUNK & MERKLE SEAL INSPECTOR"));
     assert!(rendered.contains("BLAKE3 MERKLE FILTER & MERGE AUDIT LOG"));
     assert!(!rendered.contains('\x1b'));
+}
+
+#[test]
+fn test_tier5_red_team_hardening_invariants() {
+    let key = RepoMasterKey::from_bytes([0x55u8; 32]);
+    let subkeys = key.derive_subkeys().unwrap();
+
+    // [RT-VEL-01] Unauthenticated chunks allocation bomb rejected pre-seal
+    let malicious_wire = "@vellum:header:v1 path_mac=0000000000000000 mode=text chunks=999999999\n@vellum:seal:v1 00\n";
+    let err = parse_and_verify_wireframe(&subkeys, "docs/spec.md", malicious_wire)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("MAX_WIREFRAME_CHUNKS"));
+
+    // [RT-VEL-01] 5,000-line 3-way merge executes in linear time via prefix/suffix trimming
+    let mut base_lines = Vec::with_capacity(5000);
+    for i in 0..5000 {
+        base_lines.push(format!("line {i:04}: steady unchanged invariant text\n"));
+    }
+    let mut ours_lines = base_lines.clone();
+    let mut theirs_lines = base_lines.clone();
+    ours_lines[100] = "line 0100: alpha branch patch\n".to_string();
+    theirs_lines[4900] = "line 4900: beta branch patch\n".to_string();
+    let (merged, has_conflict) = merge_three_way_lines(
+        &base_lines.concat(),
+        &ours_lines.concat(),
+        &theirs_lines.concat(),
+    );
+    assert!(!has_conflict);
+    assert!(merged.contains("alpha branch patch"));
+    assert!(merged.contains("beta branch patch"));
+
+    // [RT-VEL-02] Git config & CLI scope injection blocked
+    assert!(validate_scope_name("default\n    clean = calc.exe").is_err());
+    assert!(validate_scope_name("prod; rm -rf /").is_err());
+    assert!(validate_scope_name("-flag").is_err());
+    assert!(validate_scope_name("prod_2026-main").is_ok());
+
+    let mut vault = VellumVault::open_in_memory_for_test(b"red-team-pass").unwrap();
+    assert!(vault.ensure_scope_key("bad scope; id").is_err());
+    let sk = vault.ensure_scope_key("prod_2026-main").unwrap();
+    let fp = vault.scope_fingerprint(&sk);
+    assert_eq!(fp.len(), 12);
+
+    // [RT-VEL-03] Path traversal & colon rejection + deterministic collapsing
+    assert!(validate_and_normalize_repo_path("../secrets.txt").is_err());
+    assert!(validate_and_normalize_repo_path("docs/../../etc/passwd").is_err());
+    assert!(validate_and_normalize_repo_path("C:secret.md").is_err());
+    assert!(validate_and_normalize_repo_path("bad\0path.md").is_err());
+    assert_eq!(
+        validate_and_normalize_repo_path(r".\docs//./arch.md").unwrap(),
+        "docs/arch.md"
+    );
+
+    // [RT-VEL-04] AEAD decrypt & key encoder return Zeroizing wrappers
+    let k = [0xAAu8; 32];
+    let ct = aead_encrypt(&k, b"aad", b"top-secret").unwrap();
+    let pt: zeroize::Zeroizing<Vec<u8>> = aead_decrypt(&k, b"aad", &ct).unwrap();
+    assert_eq!(pt.as_slice(), b"top-secret");
+    let encoded: zeroize::Zeroizing<String> = key.encode_key_b64();
+    assert!(encoded.starts_with("vellum-key-v1:"));
+
+    // [RT-VEL-05] Unresolved conflict markers rejected on regular clean, permitted on merge driver
+    let conflicted = "<<<<<<< OURS\nalpha\n=======\nbeta\n>>>>>>> THEIRS\n";
+    assert!(clean_to_wireframe(&subkeys, "docs/spec.md", conflicted.as_bytes(), None).is_err());
+    assert!(
+        clean_to_wireframe_allow_conflicts(&subkeys, "docs/spec.md", conflicted.as_bytes(), None)
+            .is_ok()
+    );
 }

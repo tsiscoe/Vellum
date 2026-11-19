@@ -4,7 +4,10 @@ use anyhow::{Result, anyhow};
 use zeroize::Zeroizing;
 
 use crate::crypto::RepoSubkeys;
-use crate::wire::{clean_to_wireframe, smudge_from_wireframe};
+use crate::wire::{clean_to_wireframe_allow_conflicts, smudge_from_wireframe};
+
+/// Maximum interior DP matrix cells (`4M` = `~32 MiB`) before skipping full LCS recovery.
+pub const MAX_LCS_CELLS: usize = 4_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Hunk {
@@ -21,35 +24,67 @@ fn split_lines_inclusive(text: &str) -> Vec<&str> {
     text.split_inclusive('\n').collect()
 }
 
-/// Compute Longest Common Subsequence anchor pairs `(base_idx, side_idx)`.
+/// Compute Longest Common Subsequence anchor pairs `(base_idx, side_idx)` with `O(N + M)`
+/// common prefix/suffix stripping and bounded interior DP memory (`CWE-400`).
 fn lcs_anchors<'a>(base: &[&'a str], side: &[&'a str]) -> Vec<(usize, usize)> {
     let n = base.len();
     let m = side.len();
-    let mut dp = vec![vec![0usize; m + 1]; n + 1];
 
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            dp[i][j] = if base[i] == side[j] {
-                dp[i + 1][j + 1] + 1
+    let mut prefix_len = 0usize;
+    while prefix_len < n && prefix_len < m && base[prefix_len] == side[prefix_len] {
+        prefix_len += 1;
+    }
+
+    let mut suffix_len = 0usize;
+    while prefix_len + suffix_len < n
+        && prefix_len + suffix_len < m
+        && base[n - 1 - suffix_len] == side[m - 1 - suffix_len]
+    {
+        suffix_len += 1;
+    }
+
+    let mut anchors = Vec::with_capacity(prefix_len + suffix_len + 16);
+    for idx in 0..prefix_len {
+        anchors.push((idx, idx));
+    }
+
+    let base_mid = &base[prefix_len..n - suffix_len];
+    let side_mid = &side[prefix_len..m - suffix_len];
+    let nm = base_mid.len();
+    let mm = side_mid.len();
+
+    if nm > 0 && mm > 0 && nm.saturating_mul(mm) <= MAX_LCS_CELLS {
+        let mut dp = vec![vec![0usize; mm + 1]; nm + 1];
+        for i in (0..nm).rev() {
+            for j in (0..mm).rev() {
+                dp[i][j] = if base_mid[i] == side_mid[j] {
+                    dp[i + 1][j + 1] + 1
+                } else {
+                    dp[i + 1][j].max(dp[i][j + 1])
+                };
+            }
+        }
+
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < nm && j < mm {
+            if base_mid[i] == side_mid[j] {
+                anchors.push((prefix_len + i, prefix_len + j));
+                i += 1;
+                j += 1;
+            } else if dp[i + 1][j] >= dp[i][j + 1] {
+                i += 1;
             } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
+                j += 1;
+            }
         }
     }
 
-    let mut anchors = Vec::new();
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < n && j < m {
-        if base[i] == side[j] {
-            anchors.push((i, j));
-            i += 1;
-            j += 1;
-        } else if dp[i + 1][j] >= dp[i][j + 1] {
-            i += 1;
-        } else {
-            j += 1;
-        }
+    let b_suf_start = n - suffix_len;
+    let s_suf_start = m - suffix_len;
+    for k in 0..suffix_len {
+        anchors.push((b_suf_start + k, s_suf_start + k));
     }
+
     anchors
 }
 
@@ -270,7 +305,8 @@ pub fn merge_encrypted_wireframes(
 
     let (merged, has_conflict) = merge_three_way_lines(&base_str, &ours_str, &theirs_str);
     let merged_zero = Zeroizing::new(merged);
-    let sealed = clean_to_wireframe(subkeys, rel_path, merged_zero.as_bytes(), None)?;
+    let sealed =
+        clean_to_wireframe_allow_conflicts(subkeys, rel_path, merged_zero.as_bytes(), None)?;
     Ok((sealed, has_conflict))
 }
 

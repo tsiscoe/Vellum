@@ -8,13 +8,13 @@ use clap::Parser;
 use zeroize::{Zeroize, Zeroizing};
 
 use vellum::cli::{Cli, Commands};
-use vellum::crypto::{RepoMasterKey, normalize_repo_path, parse_repo_key};
+use vellum::crypto::{RepoMasterKey, normalize_repo_path, parse_repo_key, validate_scope_name};
 use vellum::merge::{merge_encrypted_wireframes, unified_diff_text};
 use vellum::tui::{VellumTuiApp, run_interactive_tui};
-use vellum::vault::{NewAuditEvent, VellumVault};
+use vellum::vault::{NewAuditEvent, VellumVault, enforce_owner_only_acl};
 use vellum::wire::{
-    clean_to_wireframe, diff_wireframes_stats, is_vellum_wireframe, parse_and_verify_wireframe,
-    smudge_from_wireframe,
+    MAX_WIREFRAME_BYTES, clean_to_wireframe, diff_wireframes_stats, is_vellum_wireframe,
+    parse_and_verify_wireframe, smudge_from_wireframe,
 };
 
 const KEYRING_SERVICE: &str = "vellum-vault";
@@ -111,6 +111,7 @@ fn resolve_repo_key_and_vault(
     use_keyring: bool,
     scope: &str,
 ) -> Result<(RepoMasterKey, Option<VellumVault>)> {
+    validate_scope_name(scope)?;
     if let Some(spec) = key_opt {
         return Ok((load_repo_key_spec(spec)?, None));
     }
@@ -121,14 +122,55 @@ fn resolve_repo_key_and_vault(
     Ok((key, Some(vault)))
 }
 
+fn read_bounded_file(path: &Path) -> Result<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing to read symlinked input path {}",
+            path.display()
+        ));
+    }
+    if meta.len() > MAX_WIREFRAME_BYTES as u64 {
+        return Err(anyhow!(
+            "input {} exceeds Vellum 32 MiB ceiling ({} > {} bytes)",
+            path.display(),
+            meta.len(),
+            MAX_WIREFRAME_BYTES
+        ));
+    }
+    let file =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut buf = Vec::with_capacity((meta.len() as usize).min(64 * 1024));
+    file.take((MAX_WIREFRAME_BYTES + 1) as u64)
+        .read_to_end(&mut buf)?;
+    if buf.len() > MAX_WIREFRAME_BYTES {
+        return Err(anyhow!(
+            "input {} exceeds Vellum 32 MiB ceiling",
+            path.display()
+        ));
+    }
+    Ok(buf)
+}
+
+fn read_bounded_string(path: &Path) -> Result<String> {
+    let bytes = read_bounded_file(path)?;
+    String::from_utf8(bytes).map_err(|_| anyhow!("input {} is not valid UTF-8", path.display()))
+}
+
 fn read_bytes_arg(input: Option<PathBuf>) -> Result<Vec<u8>> {
     match input {
-        Some(path) => {
-            std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))
-        }
+        Some(path) => read_bounded_file(&path),
         None => {
             let mut buf = Vec::new();
-            std::io::stdin().read_to_end(&mut buf)?;
+            std::io::stdin()
+                .take((MAX_WIREFRAME_BYTES + 1) as u64)
+                .read_to_end(&mut buf)?;
+            if buf.len() > MAX_WIREFRAME_BYTES {
+                return Err(anyhow!(
+                    "stdin stream exceeds Vellum 32 MiB ceiling ({MAX_WIREFRAME_BYTES} bytes)"
+                ));
+            }
             Ok(buf)
         }
     }
@@ -146,20 +188,28 @@ fn write_bytes_arg(output: Option<PathBuf>, data: &[u8]) -> Result<()> {
 }
 
 fn collect_tree_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    if dir.is_file() {
+    let root_meta = std::fs::symlink_metadata(dir)?;
+    if root_meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    if root_meta.is_file() {
         out.push(dir.to_path_buf());
         return Ok(());
     }
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let p = entry.path();
+        let meta = std::fs::symlink_metadata(&p)?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
         let name = entry.file_name();
         let s = name.to_string_lossy();
-        if p.is_dir() {
+        if meta.is_dir() {
             if !matches!(s.as_ref(), ".git" | "target" | "node_modules" | ".venv") {
                 collect_tree_files(&p, out)?;
             }
-        } else if p.is_file() {
+        } else if meta.is_file() {
             out.push(p);
         }
     }
@@ -170,9 +220,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { scope, export_key } => {
+        Commands::Init {
+            scope,
+            export_key,
+            reveal,
+        } => {
+            validate_scope_name(&scope)?;
             let mut vault = open_vault(cli.vault, cli.keyring, false)?;
             let key = vault.ensure_scope_key(&scope)?;
+            let fp = vault.scope_fingerprint(&key);
             let encoded = key.encode_key_b64();
             if let Some(out_path) = export_key {
                 if let Some(parent) = out_path.parent()
@@ -180,20 +236,28 @@ fn main() -> Result<()> {
                 {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(&out_path, format!("{encoded}\n"))?;
+                std::fs::write(&out_path, format!("{}\n", *encoded))?;
+                enforce_owner_only_acl(&out_path, false)?;
             }
+            let display_key = if reveal {
+                encoded.to_string()
+            } else {
+                "[REDACTED — pass --reveal or --export-key]".to_string()
+            };
             if cli.json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "vault": vault.db_path(),
                         "scope": scope,
-                        "key": encoded,
+                        "fingerprint": fp,
+                        "key": display_key,
                     }))?
                 );
             } else {
                 println!("Initialized Vellum vault: {}", vault.db_path().display());
-                println!("Scope '{scope}' key: {encoded}");
+                println!("Scope '{scope}' fingerprint: {fp}");
+                println!("Scope '{scope}' key: {display_key}");
             }
         }
 
@@ -263,9 +327,9 @@ fn main() -> Result<()> {
             let (repo_key, mut vault_opt) =
                 resolve_repo_key_and_vault(key.as_deref(), cli.vault, cli.keyring, &scope)?;
             let subkeys = repo_key.derive_subkeys()?;
-            let base_wire = std::fs::read_to_string(&base)?;
-            let ours_wire = std::fs::read_to_string(&ours)?;
-            let theirs_wire = std::fs::read_to_string(&theirs)?;
+            let base_wire = read_bounded_string(&base)?;
+            let ours_wire = read_bounded_string(&ours)?;
+            let theirs_wire = read_bounded_string(&theirs)?;
             let (merged_wire, has_conflict) =
                 merge_encrypted_wireframes(&subkeys, &path, &base_wire, &ours_wire, &theirs_wire)?;
 
@@ -303,8 +367,8 @@ fn main() -> Result<()> {
             let (repo_key, _) =
                 resolve_repo_key_and_vault(key.as_deref(), cli.vault, cli.keyring, &scope)?;
             let subkeys = repo_key.derive_subkeys()?;
-            let wire_a = std::fs::read_to_string(&file_a)?;
-            let wire_b = std::fs::read_to_string(&file_b)?;
+            let wire_a = read_bounded_string(&file_a)?;
+            let wire_b = read_bounded_string(&file_b)?;
             let stats = diff_wireframes_stats(&wire_a, &wire_b)?;
             let pt_a = smudge_from_wireframe(&subkeys, &path, &wire_a)?;
             let pt_b = smudge_from_wireframe(&subkeys, &path, &wire_b)?;
@@ -345,7 +409,7 @@ fn main() -> Result<()> {
             let (repo_key, _) =
                 resolve_repo_key_and_vault(key.as_deref(), cli.vault, cli.keyring, &scope)?;
             let subkeys = repo_key.derive_subkeys()?;
-            let raw = std::fs::read(&file)?;
+            let raw = read_bounded_file(&file)?;
             if is_vellum_wireframe(&raw) {
                 let wire = String::from_utf8(raw)?;
                 let pt = smudge_from_wireframe(&subkeys, &path, &wire)?;
@@ -365,7 +429,7 @@ fn main() -> Result<()> {
             let mut verified_count = 0usize;
             let mut failed: Vec<(PathBuf, String)> = Vec::new();
             for f in files {
-                let Ok(raw) = std::fs::read(&f) else {
+                let Ok(raw) = read_bounded_file(&f) else {
                     continue;
                 };
                 if !is_vellum_wireframe(&raw) {
@@ -411,6 +475,7 @@ fn main() -> Result<()> {
         }
 
         Commands::GitConfig { scope } => {
+            validate_scope_name(&scope)?;
             println!("# .gitattributes");
             println!("secret_notes/** filter=vellum diff=vellum merge=vellum\n");
             println!("# .git/config");
@@ -435,8 +500,7 @@ fn main() -> Result<()> {
 
             let (wire_preview_path, wire_chunk_count, wire_seal_hex, wire_chunk_ids) =
                 if let Some(p) = file {
-                    let raw = std::fs::read_to_string(&p)
-                        .with_context(|| format!("failed to read {}", p.display()))?;
+                    let raw = read_bounded_string(&p)?;
                     let mut ids = Vec::new();
                     let mut seal = String::from("unverified-preview");
                     for line in raw.lines() {

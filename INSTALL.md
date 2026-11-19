@@ -39,6 +39,7 @@ cargo install --path .
 ```bash
 vellum --version
 vellum --keyring init --scope default --export-key ./vellum.key
+# Add --reveal if you explicitly need the raw key printed on stdout
 vellum git-config --scope default
 ```
 

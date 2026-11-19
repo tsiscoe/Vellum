@@ -19,6 +19,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 pub const SALT_LEN: usize = 16;
 pub const KEY_LEN: usize = 32;
 pub const XNONCE_LEN: usize = 24;
+pub const MAX_SCOPE_NAME_LEN: usize = 64;
 
 /// 256-bit Master Seed derived from vault passphrase via `Argon2id`.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -45,25 +46,75 @@ pub struct RepoSubkeys {
     pub seal_key: [u8; KEY_LEN],
 }
 
-/// Normalize repository-relative paths (`\` -> `/`, strip leading `./` or `/`) so Windows and
-/// POSIX Git clients derive identical SIVs, AADs, and Merkle seals.
-pub fn normalize_repo_path(rel_path: &str) -> String {
-    let forward = rel_path.trim().replace('\\', "/");
-    let mut s = forward.as_str();
-    loop {
-        if let Some(rest) = s.strip_prefix("./") {
-            s = rest;
-        } else if let Some(rest) = s.strip_prefix('/') {
-            s = rest;
-        } else {
-            break;
+/// Validate a key scope identifier (`1..=64` ASCII `[A-Za-z0-9_-]`, cannot start with `'-'`)
+/// to prevent `.git/config` directive injection, shell metacharacters, and CLI flag injection.
+pub fn validate_scope_name(scope: &str) -> Result<()> {
+    if scope.is_empty() || scope.len() > MAX_SCOPE_NAME_LEN {
+        return Err(anyhow!(
+            "invalid Vellum scope name length (must be 1..={MAX_SCOPE_NAME_LEN} ASCII chars)"
+        ));
+    }
+    if scope.starts_with('-') {
+        return Err(anyhow!(
+            "invalid Vellum scope '{scope}': scope cannot start with '-'"
+        ));
+    }
+    if !scope
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    {
+        return Err(anyhow!(
+            "invalid Vellum scope '{scope}': only ASCII [A-Za-z0-9_-] characters are permitted"
+        ));
+    }
+    Ok(())
+}
+
+/// Strictly canonicalize and validate a repository-relative path before binding it into
+/// `BLAKE3-XChaCha20-SIV` keys, AAD, or Merkle seals (`CWE-22`).
+///
+/// Rejects empty paths, ASCII control bytes, Windows drive colons (`:`), and `..` traversal
+/// segments while collapsing duplicate `/` and `.` segments deterministically.
+pub fn validate_and_normalize_repo_path(rel_path: &str) -> Result<String> {
+    let trimmed = rel_path.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("repository path cannot be empty"));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(anyhow!(
+            "repository path contains illegal control characters"
+        ));
+    }
+    if trimmed.contains(':') {
+        return Err(anyhow!(
+            "repository path '{trimmed}' cannot contain drive or stream colons"
+        ));
+    }
+
+    let mut segments = Vec::new();
+    for seg in trimmed.split(['/', '\\']) {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                return Err(anyhow!(
+                    "parent traversal ('..') is forbidden in repository path '{trimmed}'"
+                ));
+            }
+            s => segments.push(s),
         }
     }
-    if s.is_empty() {
-        "untitled".to_string()
-    } else {
-        s.to_string()
+
+    if segments.is_empty() {
+        return Err(anyhow!("repository path '{trimmed}' resolves to empty"));
     }
+    Ok(segments.join("/"))
+}
+
+/// Canonicalize repository-relative paths (`\` -> `/`, collapse empty & `.` segments) for display
+/// helpers where fallible errors are omitted. Cryptographic paths MUST use
+/// [`validate_and_normalize_repo_path`].
+pub fn normalize_repo_path(rel_path: &str) -> String {
+    validate_and_normalize_repo_path(rel_path).unwrap_or_else(|_| "untitled".to_string())
 }
 
 impl RepoMasterKey {
@@ -77,8 +128,8 @@ impl RepoMasterKey {
         Self(bytes)
     }
 
-    pub fn encode_key_b64(&self) -> String {
-        format!("vellum-key-v1:{}", BASE64_STD.encode(self.0))
+    pub fn encode_key_b64(&self) -> Zeroizing<String> {
+        Zeroizing::new(format!("vellum-key-v1:{}", BASE64_STD.encode(self.0)))
     }
 
     /// Derive `cdc_key`, `siv_key`, `enc_key`, and `seal_key` via `HKDF-SHA256`.
@@ -235,7 +286,7 @@ pub fn seal_convergent_chunk(
     rel_path: &str,
     chunk_plaintext: &[u8],
 ) -> Result<(String, Vec<u8>)> {
-    let norm_path = normalize_repo_path(rel_path);
+    let norm_path = validate_and_normalize_repo_path(rel_path)?;
     let mut siv = compute_chunk_siv(&subkeys.siv_key, &norm_path, chunk_plaintext);
     let mut nonce_bytes = [0u8; XNONCE_LEN];
     nonce_bytes.copy_from_slice(&siv[0..XNONCE_LEN]);
@@ -274,7 +325,7 @@ pub fn open_convergent_chunk(
     if blob.len() < XNONCE_LEN + 16 {
         return Err(anyhow!("convergent chunk blob too short"));
     }
-    let norm_path = normalize_repo_path(rel_path);
+    let norm_path = validate_and_normalize_repo_path(rel_path)?;
     let mut nonce_bytes = [0u8; XNONCE_LEN];
     nonce_bytes.copy_from_slice(&blob[..XNONCE_LEN]);
 
@@ -335,14 +386,14 @@ pub fn aead_encrypt(key: &[u8; KEY_LEN], aad: &[u8], plaintext: &[u8]) -> Result
     Ok(out)
 }
 
-/// Decrypt `nonce[24] || ciphertext+tag` under `XChaCha20-Poly1305` and verify AAD.
-pub fn aead_decrypt(key: &[u8; KEY_LEN], aad: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
+/// Decrypt `nonce[24] || ciphertext+tag` under `XChaCha20-Poly1305` into `Zeroizing` RAM.
+pub fn aead_decrypt(key: &[u8; KEY_LEN], aad: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if blob.len() < XNONCE_LEN + 16 {
         return Err(anyhow!("AEAD blob too short"));
     }
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|_| anyhow!("invalid XChaCha20-Poly1305 key"))?;
-    cipher
+    let pt = cipher
         .decrypt(
             XNonce::from_slice(&blob[..XNONCE_LEN]),
             Payload {
@@ -350,7 +401,8 @@ pub fn aead_decrypt(key: &[u8; KEY_LEN], aad: &[u8], blob: &[u8]) -> Result<Vec<
                 aad,
             },
         )
-        .map_err(|_| anyhow!("AEAD authentication failed (tampered vault row or wrong key)"))
+        .map_err(|_| anyhow!("AEAD authentication failed (tampered vault row or wrong key)"))?;
+    Ok(Zeroizing::new(pt))
 }
 
 pub fn keyed_blake3_hex(mac_key: &[u8; KEY_LEN], domain: &str, data: &[u8]) -> String {

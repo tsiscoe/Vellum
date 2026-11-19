@@ -10,13 +10,40 @@ use zeroize::Zeroizing;
 
 use crate::chunker::{ChunkMode, chunk_bytes};
 use crate::crypto::{
-    RepoSubkeys, constant_time_eq_slice, keyed_blake3_hex, normalize_repo_path,
-    open_convergent_chunk, seal_convergent_chunk,
+    RepoSubkeys, constant_time_eq_slice, keyed_blake3_hex, open_convergent_chunk,
+    seal_convergent_chunk, validate_and_normalize_repo_path,
 };
 
 const HEADER_PREFIX: &str = "@vellum:header:v1 ";
 const CHUNK_PREFIX: &str = "@vellum:chunk:v1 ";
 const SEAL_PREFIX: &str = "@vellum:seal:v1 ";
+
+/// Maximum number of chunks permitted in a single `VELLUM-WIRE-V1` document before aborting pre-seal.
+pub const MAX_WIREFRAME_CHUNKS: usize = 65_536;
+/// Maximum input/wireframe size (`32 MiB`) permitted to prevent heap exhaustion (`CWE-400`).
+pub const MAX_WIREFRAME_BYTES: usize = 32 * 1024 * 1024;
+
+/// Detect unresolved 3-way Git merge conflict marker triplets in UTF-8 plaintext.
+pub fn contains_conflict_markers(raw: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return false;
+    };
+    let mut has_ours = false;
+    let mut has_sep = false;
+    let mut has_theirs = false;
+    for line in text.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.starts_with("<<<<<<< ") {
+            has_ours = true;
+        } else if has_ours && line == "=======" {
+            has_sep = true;
+        } else if has_ours && has_sep && line.starts_with(">>>>>>> ") {
+            has_theirs = true;
+            break;
+        }
+    }
+    has_ours && has_sep && has_theirs
+}
 
 /// Parsed and Merkle-verified wireframe components.
 #[derive(Debug, Clone)]
@@ -81,21 +108,63 @@ fn compute_file_seal(
 /// Encrypt raw file bytes into a deterministic, Merkle-sealed `VELLUM-WIRE-V1` text wireframe.
 ///
 /// Idempotent: if `raw` is already a valid `VELLUM-WIRE-V1` document for `rel_path`, it verifies
-/// the Merkle seal and returns it unchanged rather than double-encrypting.
+/// the Merkle seal and returns it unchanged rather than double-encrypting. Refuses unresolved
+/// Git merge conflict markers unless invoked via [`clean_to_wireframe_allow_conflicts`].
 pub fn clean_to_wireframe(
     subkeys: &RepoSubkeys,
     rel_path: &str,
     raw: &[u8],
     forced_mode: Option<ChunkMode>,
 ) -> Result<String> {
+    clean_to_wireframe_inner(subkeys, rel_path, raw, forced_mode, false)
+}
+
+/// Variant of [`clean_to_wireframe`] used strictly by the 3-way merge driver to re-seal an
+/// intentional conflicted merge result back into `VELLUM-WIRE-V1`.
+pub fn clean_to_wireframe_allow_conflicts(
+    subkeys: &RepoSubkeys,
+    rel_path: &str,
+    raw: &[u8],
+    forced_mode: Option<ChunkMode>,
+) -> Result<String> {
+    clean_to_wireframe_inner(subkeys, rel_path, raw, forced_mode, true)
+}
+
+fn clean_to_wireframe_inner(
+    subkeys: &RepoSubkeys,
+    rel_path: &str,
+    raw: &[u8],
+    forced_mode: Option<ChunkMode>,
+    allow_conflicts: bool,
+) -> Result<String> {
+    if raw.len() > MAX_WIREFRAME_BYTES {
+        return Err(anyhow!(
+            "input exceeds Vellum 32 MiB ceiling ({} > {} bytes)",
+            raw.len(),
+            MAX_WIREFRAME_BYTES
+        ));
+    }
+    let norm_path = validate_and_normalize_repo_path(rel_path)?;
+
     if is_vellum_wireframe(raw) {
         let s = std::str::from_utf8(raw)?;
-        let _verified = parse_and_verify_wireframe(subkeys, rel_path, s)?;
+        let _verified = parse_and_verify_wireframe(subkeys, &norm_path, s)?;
         return Ok(s.to_string());
     }
 
-    let norm_path = normalize_repo_path(rel_path);
+    if !allow_conflicts && contains_conflict_markers(raw) {
+        return Err(anyhow!(
+            "refusing to encrypt unresolved Git merge conflict markers on '{norm_path}'"
+        ));
+    }
+
     let (mode, parts) = chunk_bytes(&subkeys.cdc_key, raw, forced_mode);
+    if parts.len() > MAX_WIREFRAME_CHUNKS {
+        return Err(anyhow!(
+            "chunk count {} exceeds MAX_WIREFRAME_CHUNKS ({MAX_WIREFRAME_CHUNKS})",
+            parts.len()
+        ));
+    }
 
     let mut chunk_entries = Vec::with_capacity(parts.len());
     for part in parts {
@@ -127,7 +196,14 @@ pub fn parse_and_verify_wireframe(
     rel_path: &str,
     wire: &str,
 ) -> Result<ParsedWireframe> {
-    let norm_path = normalize_repo_path(rel_path);
+    if wire.len() > MAX_WIREFRAME_BYTES {
+        return Err(anyhow!(
+            "wireframe exceeds Vellum 32 MiB ceiling ({} > {} bytes)",
+            wire.len(),
+            MAX_WIREFRAME_BYTES
+        ));
+    }
+    let norm_path = validate_and_normalize_repo_path(rel_path)?;
     let mut lines = wire.lines();
 
     let header_line = lines
@@ -159,6 +235,12 @@ pub fn parse_and_verify_wireframe(
     let declared_chunks =
         declared_chunks.ok_or_else(|| anyhow!("missing chunks count in wireframe header"))?;
 
+    if declared_chunks > MAX_WIREFRAME_CHUNKS {
+        return Err(anyhow!(
+            "wireframe header declares {declared_chunks} chunks exceeding MAX_WIREFRAME_CHUNKS ({MAX_WIREFRAME_CHUNKS})"
+        ));
+    }
+
     let expected_mac = compute_path_mac(&subkeys.seal_key, &norm_path);
     if !constant_time_eq_slice(path_mac.as_bytes(), expected_mac.as_bytes()) {
         return Err(anyhow!(
@@ -166,7 +248,7 @@ pub fn parse_and_verify_wireframe(
         ));
     }
 
-    let mut chunk_entries = Vec::with_capacity(declared_chunks);
+    let mut chunk_entries = Vec::with_capacity(declared_chunks.min(1024));
     let mut seal_hex: Option<String> = None;
 
     for line in lines {
@@ -174,6 +256,11 @@ pub fn parse_and_verify_wireframe(
             return Err(anyhow!("unexpected trailing content after @vellum:seal:v1"));
         }
         if let Some(rest) = line.strip_prefix(CHUNK_PREFIX) {
+            if chunk_entries.len() >= MAX_WIREFRAME_CHUNKS {
+                return Err(anyhow!(
+                    "chunk entries exceed MAX_WIREFRAME_CHUNKS ({MAX_WIREFRAME_CHUNKS})"
+                ));
+            }
             let mut parts = rest.split_whitespace();
             let chunk_id = parts
                 .next()

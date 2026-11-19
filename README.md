@@ -57,10 +57,10 @@ cargo build --release
 ### 2. Initialize Your Scoped Vault (`vellum init`)
 
 ```bash
-# Provision encrypted SQLite WAL vault + 'default' 256-bit RepoMasterKey
+# Initialize Your Scoped Vault (raw key redacted on stdout unless --reveal is passed)
 vellum --keyring init --scope default --export-key ./vellum-default.key
 
-# Print exact .gitattributes and .git/config wiring
+# Print exact .gitattributes and .git/config wiring (strict [A-Za-z0-9_-] scope validation)
 vellum git-config --scope default
 ```
 

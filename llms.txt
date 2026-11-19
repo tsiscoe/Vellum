@@ -13,7 +13,7 @@
 
 ## CLI Entrypoints
 
-- `vellum init [--scope <name>] [--export-key <file>]`
+- `vellum init [--scope <name>] [--export-key <file>] [--reveal]`
 - `vellum clean --path <rel_path> [--key <spec>] [-i <in>] [-o <out>]`
 - `vellum smudge --path <rel_path> [--key <spec>] [-i <in>] [-o <out>]`
 - `vellum merge --base <O> --ours <A> --theirs <B> --path <rel_path> [--out <dest>] [--key <spec>]`
