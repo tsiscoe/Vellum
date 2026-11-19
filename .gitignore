@@ -1,0 +1,12 @@
+/target/
+**/*.rs.bk
+*.db
+*.db-wal
+*.db-shm
+*.key
+.env
+.env.*
+!.env.example
+.vellum/
+.DS_Store
+Thumbs.db

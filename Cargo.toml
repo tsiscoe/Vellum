@@ -1,0 +1,77 @@
+[package]
+name = "vellum"
+version = "0.1.0"
+edition = "2024"
+authors = ["tsiscoe <tsiscoe@users.noreply.github.com>"]
+description = "Vellum: Chunk-Convergent BLAKE3-XChaCha20-SIV Git Filter, In-RAM 3-Way Merge Driver & Merkle-Sealed Diff Engine (Pure Rust 2024)"
+license = "MIT"
+repository = "https://github.com/tsiscoe/Vellum"
+readme = "README.md"
+keywords = ["cryptography", "git", "siv", "cdc", "encryption"]
+categories = ["command-line-utilities", "cryptography", "development-tools"]
+
+[[bin]]
+name = "vellum"
+path = "src/main.rs"
+
+[lib]
+name = "vellum"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cryptography (Argon2id + HKDF-SHA256 + BLAKE3 + XChaCha20-Poly1305 + Zeroize)
+x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
+argon2 = { version = "0.5", features = ["std"] }
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+hkdf = "0.12"
+sha2 = "0.10"
+blake3 = "1.5"
+rand = "0.8"
+zeroize = { version = "1.8", features = ["derive"] }
+hex = "0.4"
+base64 = "0.22"
+
+# Storage (SQLite WAL mode bundled >= 3.51.2)
+rusqlite = { version = "0.42.0", features = ["bundled"] }
+
+# Pattern Scanning & Async Runtime
+regex = "1.11"
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+
+# TUI (Ratatui v0.30+ & Crossterm)
+ratatui = "0.30"
+crossterm = "0.28"
+
+# OS Keyring
+keyring = { version = "3.6", features = ["windows-native", "apple-native", "linux-native"] }
+
+# Utilities
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6.0"
+rpassword = "7.3"
+
+[dev-dependencies]
+tempfile = "3.14"
+proptest = "1.5"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake3]
+opt-level = 3
+
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+
+[profile.dev.package.x25519-dalek]
+opt-level = 3
