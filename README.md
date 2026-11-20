@@ -5,7 +5,7 @@
 [![Rust: 2024 Edition](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](Cargo.toml)
 [![Safety: #![forbid(unsafe_code)]](https://img.shields.io/badge/unsafe-forbid-success.svg)](src/lib.rs)
 
-**Vellum** (`vellum`) is a pure-Rust (`#![forbid(unsafe_code)]`) **Chunk-Convergent `BLAKE3-XChaCha20-SIV` Git Clean/Smudge Filter, Zero-Disk In-RAM 3-Way Merge Driver, and Merkle-Sealed Diff Engine**.
+**Vellum** (`vellum`) is a pure-Rust (`#![forbid(unsafe_code)]`) transparent Git encryption filter: it encrypts sensitive files paragraph-by-paragraph so `git diff` and 3-way merges still work in RAM, while plaintext never touches your remote repo.
 
 ---
 
