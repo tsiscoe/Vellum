@@ -54,7 +54,7 @@ keyring = { version = "3.6", features = ["windows-native", "apple-native", "linu
 # Utilities
 uuid = { version = "1.11", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting"] }
-dirs = "6.0"
+dirs = "7.0"
 rpassword = "7.3"
 tempfile = "3.14"
 
