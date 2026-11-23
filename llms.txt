@@ -1,24 +1,26 @@
 # Vellum (`vellum` v0.1.0)
 
-> Pure-Rust 2024 (`#![forbid(unsafe_code)]`) chunk-convergent `BLAKE3-XChaCha20-SIV` Git clean/smudge filter, zero-disk in-RAM 3-way merge driver, and Merkle-sealed diff engine.
+> Pure-Rust 2024 (`#![forbid(unsafe_code)]`) paragraph-convergent Git encryption filter (`BLAKE3-XChaCha20-SIV`), zero-disk in-RAM 3-way merge driver, and Merkle-sealed diff/verification CLI.
 
 ## Core Modules
 
-- `src/crypto/mod.rs`: `MasterSeed`, `RepoMasterKey`, `RepoSubkeys` (`cdc_key`, `siv_key`, `enc_key`, `seal_key`), path normalization, and deterministic `BLAKE3-XChaCha20-SIV` chunk AEAD.
+- `src/crypto/mod.rs`: `MasterSeed`, `RepoMasterKey`, `RepoSubkeys` (`cdc_key`, `siv_key`, `enc_key`, `seal_key`), strict path/scope validation, and deterministic `BLAKE3-XChaCha20-SIV` chunk AEAD with `Zeroizing` custody.
 - `src/chunker/mod.rs`: Lossless `TextBlocks` paragraph/heading splitter and `BLAKE3 XOF`-keyed 64-bit Gear-CDC binary chunker.
-- `src/wire/mod.rs`: `VELLUM-WIRE-V1` encoder, idempotent `clean_to_wireframe`, Merkle-seal verifier (`parse_and_verify_wireframe`), `smudge_from_wireframe`, and `diff_wireframes_stats`.
-- `src/merge/mod.rs`: In-RAM LCS 3-way merge (`merge_three_way_lines`, `merge_encrypted_wireframes`) and unified plaintext diff (`unified_diff_text`).
-- `src/vault/mod.rs`: `Argon2id` + `XChaCha20-Poly1305` SQLite WAL custody vault (`rusqlite 0.42.0`) and encrypted `BLAKE3` Merkle `seal_audit_log`.
-- `src/tui/{mod,ui}.rs`: 3-pane `Ratatui v0.30` dashboard with `CWE-150` escape sanitization.
+- `src/wire/mod.rs`: `VELLUM-WIRE-V1` encoder, idempotent `clean_to_wireframe`, pre-decrypt Merkle-seal verifier (`parse_and_verify_wireframe`), `smudge_from_wireframe`, and `diff_wireframes_stats`.
+- `src/merge/mod.rs`: Bounded in-RAM LCS 3-way merge (`merge_three_way_lines`, `merge_encrypted_wireframes`) and unified plaintext diff (`unified_diff_text`).
+- `src/vault/mod.rs`: Owner-only `Argon2id` + `XChaCha20-Poly1305` SQLite WAL custody vault (`rusqlite 0.42.0`) and chained intent/outcome audit log.
+- `src/verify.rs` & `src/output.rs`: Trusted Git index/revision manifest verifier and atomic output writer.
+- `src/tui/{mod,ui}.rs`: 3-pane `Ratatui v0.30` dashboard with `CWE-150` terminal escape sanitization.
 
 ## CLI Entrypoints
 
-- `vellum init [--scope <name>] [--export-key <file>] [--reveal]`
-- `vellum clean --path <rel_path> [--key <spec>] [-i <in>] [-o <out>]`
-- `vellum smudge --path <rel_path> [--key <spec>] [-i <in>] [-o <out>]`
-- `vellum merge --base <O> --ours <A> --theirs <B> --path <rel_path> [--out <dest>] [--key <spec>]`
-- `vellum diff <wire_a> <wire_b> --path <rel_path> [--key <spec>]`
-- `vellum textconv <wire_file> --path <rel_path> [--key <spec>]`
-- `vellum verify-tree [--dir <path>] [--key <spec>]`
-- `vellum git-config [--scope <name>]`
-- `vellum tui [--file <wire_file>]`
+- `vellum [--keyring] [--vault <db>] [--json] init [--scope <name>] [--export-key <new_file>] [--reveal]`
+- `vellum [--keyring] clean --path <rel_path> [--scope <name>] [--key <spec>] [-i <in>] [-o <out>]`
+- `vellum [--keyring] smudge --path <rel_path> [--scope <name>] [--key <spec>] [-i <in>] [-o <out>]`
+- `vellum [--keyring] merge --base <O> --ours <A> --theirs <B> --path <rel_path> [--out <dest>] [--scope <name>] [--key <spec>]`
+- `vellum [--keyring] diff <wire_a> <wire_b> --path <rel_path> [--scope <name>] [--key <spec>]`
+- `vellum [--keyring] textconv <wire_file> --path <rel_path> [--scope <name>] [--key <spec>]`
+- `vellum [--keyring] verify-tree [--dir <path>] [--staged | --revision <rev>] [--manifest <paths.json>] [--scope <name>] [--key <spec>]`
+- `vellum [--keyring] audit-verify [--anchor-count <N> --anchor-head <hash>]`
+- `vellum [--keyring] git-config [--scope <name>]`
+- `vellum [--keyring] tui [--file <wire_file>]`

@@ -94,6 +94,4 @@ jobs:
       - name: Run cargo-audit
         run: |
           cargo install cargo-audit --version 0.23.0 --locked
-          # RUSTSEC-2026-0543 is an informational unmaintained notice for chrono (no CVE).
-          # Keep --deny warnings active so any new vulnerability, yanked, or unmaintained crate fails CI.
-          cargo audit --ignore RUSTSEC-2026-0543 --deny warnings
+          cargo audit --deny warnings

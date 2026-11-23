@@ -142,9 +142,9 @@ pub enum Commands {
         key: Option<String>,
     },
 
-    /// Git `textconv` driver: decrypt a wireframe file cleanly to stdout for `git diff` / `git log -p`.
+    /// Decrypt a wireframe to stdout with an explicit authenticated Git path.
     Textconv {
-        /// Encrypted wireframe file path passed by Git (`textconv`).
+        /// Encrypted wireframe file.
         file: PathBuf,
 
         /// Repository-relative file path.
@@ -160,11 +160,23 @@ pub enum Commands {
         key: Option<String>,
     },
 
-    /// Audit all `VELLUM-WIRE-V1` files in a repository tree for intact Merkle seals.
+    /// Audit recognized worktree files or require verified Git objects for a trusted manifest.
     VerifyTree {
         /// Root directory to audit.
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+
+        /// Independently maintained JSON array of canonical Git-relative protected paths.
+        #[arg(long, requires = "git_source")]
+        manifest: Option<PathBuf>,
+
+        /// Verify one snapshot of the staged index against the manifest.
+        #[arg(long, group = "git_source", requires = "manifest")]
+        staged: bool,
+
+        /// Verify the Git tree of this revision against the manifest.
+        #[arg(long, group = "git_source", requires = "manifest")]
+        revision: Option<String>,
 
         /// Scope name inside `vellum.db` when `--key` is omitted.
         #[arg(long, default_value = "default")]
@@ -175,11 +187,22 @@ pub enum Commands {
         key: Option<String>,
     },
 
-    /// Print copy-pasteable `.gitattributes` and `.git/config` filter/diff/merge configuration.
+    /// Print copy-pasteable `.gitattributes` and `.git/config` filter/merge configuration.
     GitConfig {
         /// Scope name inside `vellum.db`.
         #[arg(long, default_value = "default")]
         scope: String,
+    },
+
+    /// Verify the vault's audit history and emit a checkpoint for external retention.
+    AuditVerify {
+        /// Entry count from a trusted, externally retained checkpoint.
+        #[arg(long, requires = "anchor_head")]
+        anchor_count: Option<usize>,
+
+        /// Head hash from the same trusted checkpoint.
+        #[arg(long, requires = "anchor_count")]
+        anchor_head: Option<String>,
     },
 
     /// Launch the 3-pane Ratatui v0.30 custody, wireframe inspector, and Merkle audit dashboard.

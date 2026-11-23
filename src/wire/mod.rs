@@ -20,8 +20,14 @@ const SEAL_PREFIX: &str = "@vellum:seal:v1 ";
 
 /// Maximum number of chunks permitted in a single `VELLUM-WIRE-V1` document before aborting pre-seal.
 pub const MAX_WIREFRAME_CHUNKS: usize = 65_536;
-/// Maximum input/wireframe size (`32 MiB`) permitted to prevent heap exhaustion (`CWE-400`).
-pub const MAX_WIREFRAME_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum decoded file size.
+pub const MAX_PLAINTEXT_BYTES: usize = 32 * 1024 * 1024;
+const CHUNK_CRYPTO_OVERHEAD: usize = crate::crypto::XNONCE_LEN + 16;
+/// Bounded serialized size, including base64 expansion, chunk identifiers and framing.
+pub const MAX_WIREFRAME_BYTES: usize =
+    (MAX_PLAINTEXT_BYTES + CHUNK_CRYPTO_OVERHEAD * MAX_WIREFRAME_CHUNKS).div_ceil(3) * 4
+        + (CHUNK_PREFIX.len() + 16 + 2 + 3) * MAX_WIREFRAME_CHUNKS
+        + 256;
 
 /// Detect unresolved 3-way Git merge conflict marker triplets in UTF-8 plaintext.
 pub fn contains_conflict_markers(raw: &[u8]) -> bool {
@@ -137,21 +143,27 @@ fn clean_to_wireframe_inner(
     forced_mode: Option<ChunkMode>,
     allow_conflicts: bool,
 ) -> Result<String> {
-    if raw.len() > MAX_WIREFRAME_BYTES {
-        return Err(anyhow!(
-            "input exceeds Vellum 32 MiB ceiling ({} > {} bytes)",
-            raw.len(),
-            MAX_WIREFRAME_BYTES
-        ));
-    }
     let norm_path = validate_and_normalize_repo_path(rel_path)?;
 
+    if raw.len() > MAX_WIREFRAME_BYTES {
+        return Err(anyhow!("input exceeds Vellum wireframe size limit"));
+    }
     if is_vellum_wireframe(raw) {
         let s = std::str::from_utf8(raw)?;
-        let _verified = parse_and_verify_wireframe(subkeys, &norm_path, s)?;
+        if allow_conflicts {
+            parse_and_verify_wireframe(subkeys, &norm_path, s)?;
+        } else {
+            let plaintext = smudge_from_wireframe(subkeys, &norm_path, s)?;
+            if contains_conflict_markers(&plaintext) {
+                return Err(anyhow!("refusing to stage unresolved Git merge conflicts"));
+            }
+        }
         return Ok(s.to_string());
     }
 
+    if raw.len() > MAX_PLAINTEXT_BYTES {
+        return Err(anyhow!("plaintext exceeds Vellum 32 MiB size limit"));
+    }
     if !allow_conflicts && contains_conflict_markers(raw) {
         return Err(anyhow!(
             "refusing to encrypt unresolved Git merge conflict markers on '{norm_path}'"
@@ -186,6 +198,11 @@ fn clean_to_wireframe_inner(
         out.push_str(&format!("{CHUNK_PREFIX}{chunk_id} {b64}\n"));
     }
     out.push_str(&format!("{SEAL_PREFIX}{seal_hex}\n"));
+    if out.len() > MAX_WIREFRAME_BYTES {
+        return Err(anyhow!(
+            "serialized output exceeds Vellum wireframe size limit"
+        ));
+    }
     Ok(out)
 }
 
@@ -198,7 +215,7 @@ pub fn parse_and_verify_wireframe(
 ) -> Result<ParsedWireframe> {
     if wire.len() > MAX_WIREFRAME_BYTES {
         return Err(anyhow!(
-            "wireframe exceeds Vellum 32 MiB ceiling ({} > {} bytes)",
+            "wireframe exceeds Vellum size limit ({} > {} bytes)",
             wire.len(),
             MAX_WIREFRAME_BYTES
         ));
@@ -250,16 +267,15 @@ pub fn parse_and_verify_wireframe(
 
     let mut chunk_entries = Vec::with_capacity(declared_chunks.min(1024));
     let mut seal_hex: Option<String> = None;
+    let mut decoded_bytes = 0;
 
     for line in lines {
         if seal_hex.is_some() {
             return Err(anyhow!("unexpected trailing content after @vellum:seal:v1"));
         }
         if let Some(rest) = line.strip_prefix(CHUNK_PREFIX) {
-            if chunk_entries.len() >= MAX_WIREFRAME_CHUNKS {
-                return Err(anyhow!(
-                    "chunk entries exceed MAX_WIREFRAME_CHUNKS ({MAX_WIREFRAME_CHUNKS})"
-                ));
+            if chunk_entries.len() >= declared_chunks {
+                return Err(anyhow!("wireframe includes more chunks than declared"));
             }
             let mut parts = rest.split_whitespace();
             let chunk_id = parts
@@ -274,11 +290,20 @@ pub fn parse_and_verify_wireframe(
             let blob = BASE64_URL
                 .decode(b64)
                 .map_err(|e| anyhow!("invalid Base64URL chunk payload: {e}"))?;
+            decoded_bytes += blob
+                .len()
+                .checked_sub(CHUNK_CRYPTO_OVERHEAD)
+                .ok_or_else(|| {
+                    anyhow!("wireframe chunk is shorter than its authentication data")
+                })?;
+            if decoded_bytes > MAX_PLAINTEXT_BYTES {
+                return Err(anyhow!("decoded content exceeds Vellum 32 MiB size limit"));
+            }
             chunk_entries.push((chunk_id.to_string(), blob));
         } else if let Some(rest) = line.strip_prefix(SEAL_PREFIX) {
             seal_hex = Some(rest.trim().to_string());
         } else if !line.trim().is_empty() {
-            return Err(anyhow!("unexpected line in Vellum wireframe: '{line}'"));
+            return Err(anyhow!("unexpected line in Vellum wireframe"));
         }
     }
 

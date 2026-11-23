@@ -1,16 +1,14 @@
 # Changelog
 
-All notable changes to **Vellum** (`vellum`) live here.
+Everything that changed in **Vellum**, written so you don't need a decoder ring to read the release notes.
 
-## [0.1.0] - 2026-11-18
+## [0.1.0] - 2026-11-22
 
-Initial release & `/red-team-recon` hardening: encrypted Git repositories that stop acting like unmergeable binary bricks.
+Initial public release after two rounds of adversarial red-team vetting: Git file encryption that stops treating every typo fix like a full-file binary demolition derby.
 
-### Added
-- **Convergent `BLAKE3-XChaCha20-SIV` Engine (`src/crypto/mod.rs`).** `RepoMasterKey` + `HKDF-SHA256` expansion (`cdc_key`, `siv_key`, `enc_key`, `seal_key`), path-normalized synthetic IVs, per-chunk encryption keys, and constant-time plaintext SIV re-verification (`CWE-208`, `Zeroizing`).
-- **TextBlocks & Keyed Gear-CDC Chunker (`src/chunker/mod.rs`).** Structure-aware Markdown/prose/code paragraph splitting alongside a `BLAKE3 XOF`-keyed 64-bit Gear rolling-hash binary chunker guaranteeing lossless byte roundtrips.
-- **`VELLUM-WIRE-V1` & Merkle File Seal (`src/wire/mod.rs`).** Ordered chunk serialization, header `path_mac`, full-file `@vellum:seal:v1` authentication defeating reordering/deletion/cross-file swaps, idempotent `clean`, and `diff_wireframes_stats`.
-- **Zero-Disk In-RAM 3-Way Merge Driver (`src/merge/mod.rs`).** Prefix/suffix-trimmed bounded LCS 3-way line merger over decrypted `Zeroizing` wireframes with clean non-overlapping merges, Git conflict markers, and unified `textconv` diffing.
-- **Encrypted Vault, CLI & 3-Pane `Ratatui` TUI (`src/vault/`, `src/cli.rs`, `src/main.rs`, `src/tui/`).** `Argon2id` + `XChaCha20-Poly1305` SQLite WAL vault (`rusqlite 0.42.0`, `BEGIN IMMEDIATE`, `PRAGMA secure_delete = ON`, fail-closed `icacls` / `0600`), `BLAKE3`-chained encrypted `seal_audit_log`, full CLI (`init`, `clean`, `smudge`, `merge`, `diff`, `textconv`, `verify-tree`, `git-config`, `tui`), and `CWE-150` ANSI-sanitized `Ratatui v0.30` dashboard.
-- **Red-Team Recon Hardening (`WP-1`..`WP-5`).** Pre-seal `MAX_WIREFRAME_CHUNKS` (`65_536`) / `MAX_WIREFRAME_BYTES` (`32 MiB`) ceilings, `MAX_LCS_CELLS` (`4M`) prefix/suffix-trimmed merge bounds (`CWE-400`/`CWE-789`), strict `[A-Za-z0-9_-]` scope validation preventing `.git/config` injection (`CWE-78`), canonical `validate_and_normalize_repo_path` + symlink-skipping tree walks (`CWE-22`/`CWE-59`), `Zeroizing` AEAD outputs + stdout key redaction unless `--reveal` is passed (`CWE-316`), and unresolved Git conflict-marker rejection on `clean` (`CWE-354`).
-- **CI & Verification Suite.** Cross-platform GitHub Actions workflow (`.github/workflows/ci.yml`) and 10 unit/integration/`proptest!` suites.
+### What's In the Box
+- **Paragraph-by-Paragraph Encryption (`src/crypto/`, `src/chunker/`):** Splits text documents cleanly on paragraphs and headings (and binary files with a secret-keyed rolling slicer) so editing one paragraph leaves the other 95% of the encrypted file untouched in `git diff`.
+- **Tamper-Proof File Seals (`src/wire/`):** Stamps every encrypted file with a keyed `BLAKE3` seal locking its exact file path, chunk count, and paragraph order—stopping cut-and-paste, deletion, and file-swap attacks cold before decryption even starts.
+- **Zero-Disk In-RAM 3-Way Git Merges (`src/merge/`):** Unlocks divergent branches inside self-wiping RAM, merges non-overlapping edits cleanly, flags genuine line collisions with normal Git conflict markers, and re-seals the result without dropping plaintext temp files onto your drive.
+- **Locked-Down Local Key Vault & TUI (`src/vault/`, `src/tui/`):** Stores scoped repo keys and a hash-chained encrypted audit log inside an owner-only SQLite vault (`Argon2id` + `XChaCha20-Poly1305`), paired with an ANSI-scrubbed 3-pane `Ratatui` terminal inspector.
+- **Two-Pass Red-Team Hardening:** Bolted down pre-seal memory caps against fake-header bombs, bounded 3-way merge memory on giant files, locked scope names against `.git/config` command injection, blocked symlink and `..` path escapes, wiped decrypted buffers on drop, hid raw keys from terminal output unless `--reveal` is passed, and added real Git index/revision manifest verification (`verify-tree --staged` / `--revision`) plus external audit checkpoints (`audit-verify`).

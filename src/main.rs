@@ -1,24 +1,27 @@
 #![forbid(unsafe_code)]
 
+mod output;
+mod verify;
+
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use vellum::cli::{Cli, Commands};
 use vellum::crypto::{RepoMasterKey, normalize_repo_path, parse_repo_key, validate_scope_name};
-use vellum::merge::{merge_encrypted_wireframes, unified_diff_text};
+use vellum::merge::{check_text_budget, merge_encrypted_wireframes, unified_diff_text};
 use vellum::tui::{VellumTuiApp, run_interactive_tui};
-use vellum::vault::{NewAuditEvent, VellumVault, enforce_owner_only_acl};
+use vellum::vault::{NewAuditEvent, VellumVault};
 use vellum::wire::{
-    MAX_WIREFRAME_BYTES, clean_to_wireframe, diff_wireframes_stats, is_vellum_wireframe,
-    parse_and_verify_wireframe, smudge_from_wireframe,
+    MAX_WIREFRAME_BYTES, ParsedWireframe, clean_to_wireframe, diff_wireframes_stats,
+    is_vellum_wireframe, parse_and_verify_wireframe, smudge_from_wireframe,
 };
 
 const KEYRING_SERVICE: &str = "vellum-vault";
-const KEYRING_USER: &str = "default-passphrase";
 
 fn default_vault_path() -> PathBuf {
     dirs::config_dir()
@@ -27,53 +30,49 @@ fn default_vault_path() -> PathBuf {
         .join("vellum.db")
 }
 
-fn resolve_passphrase(use_keyring: bool, creating: bool) -> Result<Vec<u8>> {
-    if let Ok(env_pw) = std::env::var("VELLUM_PASSPHRASE")
-        && !env_pw.is_empty()
-    {
-        return Ok(env_pw.into_bytes());
-    }
+fn keyring_entry(path: &Path) -> Result<keyring::Entry> {
+    let canonical = path
+        .canonicalize()
+        .context("failed to resolve vault identity")?;
+    let user = blake3::hash(canonical.as_os_str().as_encoded_bytes()).to_hex();
+    keyring::Entry::new(KEYRING_SERVICE, user.as_str())
+        .map_err(|error| anyhow!("OS keyring entry initialization failed: {error}"))
+}
 
-    if use_keyring {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
-            .map_err(|e| anyhow!("OS keyring entry init failed: {e}"))?;
-        if !creating {
-            match entry.get_password() {
-                Ok(pw) if !pw.is_empty() => return Ok(pw.into_bytes()),
-                Ok(_) => {}
-                Err(err) => {
-                    eprintln!("OS keyring lookup missed ({err}); falling back to prompt.");
-                }
-            }
+fn resolve_passphrase(path: &Path, use_keyring: bool, creating: bool) -> Result<Zeroizing<String>> {
+    if let Ok(pw) = std::env::var("VELLUM_PASSPHRASE")
+        && !pw.is_empty()
+    {
+        return Ok(Zeroizing::new(pw));
+    }
+    if use_keyring && !creating {
+        match keyring_entry(path)?.get_password() {
+            Ok(pw) if !pw.is_empty() => return Ok(Zeroizing::new(pw)),
+            Ok(_) | Err(keyring::Error::NoEntry) => {}
+            Err(err) => return Err(anyhow!("OS keyring lookup failed: {err}")),
         }
     }
-
     let prompt = if creating {
         "Create Vellum vault passphrase: "
     } else {
         "Vellum vault passphrase: "
     };
-    let pw = rpassword::prompt_password(prompt).context("failed to read vault passphrase")?;
+    let pw = Zeroizing::new(
+        rpassword::prompt_password(prompt).context("failed to read vault passphrase")?,
+    );
     if pw.is_empty() {
         return Err(anyhow!("vault passphrase cannot be empty"));
     }
-
     if creating {
-        let confirm = rpassword::prompt_password("Confirm Vellum vault passphrase: ")
-            .context("failed to read confirmation passphrase")?;
-        if pw != confirm {
+        let confirm = Zeroizing::new(
+            rpassword::prompt_password("Confirm Vellum vault passphrase: ")
+                .context("failed to read confirmation passphrase")?,
+        );
+        if *pw != *confirm {
             return Err(anyhow!("passphrases did not match"));
         }
-        if use_keyring {
-            let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
-                .map_err(|e| anyhow!("OS keyring entry init failed: {e}"))?;
-            entry
-                .set_password(&pw)
-                .map_err(|e| anyhow!("failed to store passphrase in OS keyring: {e}"))?;
-        }
     }
-
-    Ok(pw.into_bytes())
+    Ok(pw)
 }
 
 fn open_vault(
@@ -82,24 +81,27 @@ fn open_vault(
     must_exist: bool,
 ) -> Result<VellumVault> {
     let path = vault_arg.unwrap_or_else(default_vault_path);
-    let exists = path.exists();
+    let exists = path.try_exists()?;
     if must_exist && !exists {
         return Err(anyhow!(
-            "Vellum vault does not exist at {} (run `vellum init` first)",
+            "Vellum vault does not exist at {} (run vellum init first)",
             path.display()
         ));
     }
-    let mut pw = resolve_passphrase(use_keyring, !exists)?;
-    let res = VellumVault::open_with_passphrase(&path, &pw, false);
-    pw.zeroize();
-    res
+    let pw = resolve_passphrase(&path, use_keyring, !exists)?;
+    let vault = VellumVault::open_with_passphrase(&path, pw.as_bytes(), false)?;
+    if use_keyring && !must_exist {
+        keyring_entry(&path)?
+            .set_password(&pw)
+            .map_err(|err| anyhow!("vault opened, but OS keyring update failed: {err}"))?;
+    }
+    Ok(vault)
 }
 
 fn load_repo_key_spec(spec: &str) -> Result<RepoMasterKey> {
     let p = Path::new(spec);
     if p.exists() && p.is_file() {
-        let content = std::fs::read_to_string(p)
-            .with_context(|| format!("failed to read Vellum key file {}", p.display()))?;
+        let content = Zeroizing::new(String::from_utf8(read_file_with_limit(p, 4096)?)?);
         return parse_repo_key(&content);
     }
     parse_repo_key(spec)
@@ -123,32 +125,27 @@ fn resolve_repo_key_and_vault(
 }
 
 fn read_bounded_file(path: &Path) -> Result<Vec<u8>> {
+    read_file_with_limit(path, MAX_WIREFRAME_BYTES)
+}
+
+fn read_file_with_limit(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
-    if meta.file_type().is_symlink() {
+    if !meta.is_file() {
         return Err(anyhow!(
-            "refusing to read symlinked input path {}",
+            "expected a regular input file at {}",
             path.display()
         ));
     }
-    if meta.len() > MAX_WIREFRAME_BYTES as u64 {
-        return Err(anyhow!(
-            "input {} exceeds Vellum 32 MiB ceiling ({} > {} bytes)",
-            path.display(),
-            meta.len(),
-            MAX_WIREFRAME_BYTES
-        ));
+    if meta.len() > limit as u64 {
+        return Err(anyhow!("input {} exceeds {limit} bytes", path.display()));
     }
     let file =
         std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut buf = Vec::with_capacity((meta.len() as usize).min(64 * 1024));
-    file.take((MAX_WIREFRAME_BYTES + 1) as u64)
-        .read_to_end(&mut buf)?;
-    if buf.len() > MAX_WIREFRAME_BYTES {
-        return Err(anyhow!(
-            "input {} exceeds Vellum 32 MiB ceiling",
-            path.display()
-        ));
+    file.take((limit + 1) as u64).read_to_end(&mut buf)?;
+    if buf.len() > limit {
+        return Err(anyhow!("input {} exceeds {limit} bytes", path.display()));
     }
     Ok(buf)
 }
@@ -168,7 +165,7 @@ fn read_bytes_arg(input: Option<PathBuf>) -> Result<Vec<u8>> {
                 .read_to_end(&mut buf)?;
             if buf.len() > MAX_WIREFRAME_BYTES {
                 return Err(anyhow!(
-                    "stdin stream exceeds Vellum 32 MiB ceiling ({MAX_WIREFRAME_BYTES} bytes)"
+                    "stdin stream exceeds Vellum wire size limit ({MAX_WIREFRAME_BYTES} bytes)"
                 ));
             }
             Ok(buf)
@@ -178,10 +175,11 @@ fn read_bytes_arg(input: Option<PathBuf>) -> Result<Vec<u8>> {
 
 fn write_bytes_arg(output: Option<PathBuf>, data: &[u8]) -> Result<()> {
     match output {
-        Some(path) => std::fs::write(&path, data)
-            .with_context(|| format!("failed to write {}", path.display())),
+        Some(path) => output::write_atomic(&path, data),
         None => {
-            std::io::stdout().write_all(data)?;
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(data)?;
+            stdout.flush()?;
             Ok(())
         }
     }
@@ -216,9 +214,62 @@ fn collect_tree_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn audit_output(
+    vault: Option<&mut VellumVault>,
+    operation: &str,
+    scope: String,
+    verified: ParsedWireframe,
+    unchanged_chunks: usize,
+    write: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let Some(vault) = vault else {
+        return write();
+    };
+    let mut event = NewAuditEvent {
+        operation: format!("{operation}-intent"),
+        scope,
+        rel_path: verified.norm_path,
+        total_chunks: verified.chunks.len(),
+        unchanged_chunks,
+        seal_short: verified.seal_hex[..16].to_string(),
+    };
+    drop(verified.chunks);
+    let intent = vault
+        .append_audit_event(event.clone())
+        .context("audit intent failed before output")?;
+    let result = write();
+    let outcome = if result.is_ok() {
+        "complete"
+    } else {
+        "output-error"
+    };
+    event.operation = format!("{operation}-{outcome}:{}", intent.seq);
+    match (result, vault.append_audit_event(event)) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(()), Err(audit)) => {
+            Err(audit.context("output was written but the audit outcome failed"))
+        }
+        (Err(error), Err(audit)) => Err(error.context(format!(
+            "output and audit outcome failed for intent {}: {audit:#}",
+            intent.seq
+        ))),
+    }
+}
 
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let merge = matches!(&cli.command, Commands::Merge { .. });
+    match run(cli) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("vellum: {error:#}");
+            ExitCode::from(if merge { 129 } else { 1 })
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Commands::Init {
             scope,
@@ -231,13 +282,10 @@ fn main() -> Result<()> {
             let fp = vault.scope_fingerprint(&key);
             let encoded = key.encode_key_b64();
             if let Some(out_path) = export_key {
-                if let Some(parent) = out_path.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&out_path, format!("{}\n", *encoded))?;
-                enforce_owner_only_acl(&out_path, false)?;
+                let mut export = Zeroizing::new(String::with_capacity(encoded.len() + 1));
+                export.push_str(&encoded);
+                export.push('\n');
+                output::export_key(&out_path, export.as_bytes())?;
             }
             let display_key = if reveal {
                 encoded.to_string()
@@ -273,18 +321,14 @@ fn main() -> Result<()> {
             let subkeys = repo_key.derive_subkeys()?;
             let raw = Zeroizing::new(read_bytes_arg(input)?);
             let wire = clean_to_wireframe(&subkeys, &path, &raw, None)?;
-            if let Some(ref mut v) = vault_opt {
+            if vault_opt.is_some() {
                 let verified = parse_and_verify_wireframe(&subkeys, &path, &wire)?;
-                let _ = v.append_audit_event(NewAuditEvent {
-                    operation: "clean".to_string(),
-                    scope,
-                    rel_path: verified.norm_path,
-                    total_chunks: verified.chunks.len(),
-                    unchanged_chunks: 0,
-                    seal_short: verified.seal_hex[..16].to_string(),
-                });
+                audit_output(vault_opt.as_mut(), "clean", scope, verified, 0, || {
+                    write_bytes_arg(output, wire.as_bytes())
+                })?;
+            } else {
+                write_bytes_arg(output, wire.as_bytes())?;
             }
-            write_bytes_arg(output, wire.as_bytes())?;
         }
 
         Commands::Smudge {
@@ -302,17 +346,18 @@ fn main() -> Result<()> {
                 .map_err(|_| anyhow!("Vellum smudge expects UTF-8 VELLUM-WIRE-V1 input"))?;
             let verified = parse_and_verify_wireframe(&subkeys, &path, &wire)?;
             let plaintext = smudge_from_wireframe(&subkeys, &path, &wire)?;
-            if let Some(ref mut v) = vault_opt {
-                let _ = v.append_audit_event(NewAuditEvent {
-                    operation: "smudge".to_string(),
-                    scope,
-                    rel_path: verified.norm_path,
-                    total_chunks: verified.chunks.len(),
-                    unchanged_chunks: verified.chunks.len(),
-                    seal_short: verified.seal_hex[..16].to_string(),
-                });
-            }
-            write_bytes_arg(output, &plaintext)?;
+            let count = verified.chunks.len();
+            audit_output(
+                vault_opt.as_mut(),
+                "smudge",
+                scope,
+                verified,
+                count,
+                || match output {
+                    Some(path) => output::write_plaintext(&path, &plaintext),
+                    None => write_bytes_arg(None, &plaintext),
+                },
+            )?;
         }
 
         Commands::Merge {
@@ -334,26 +379,17 @@ fn main() -> Result<()> {
                 merge_encrypted_wireframes(&subkeys, &path, &base_wire, &ours_wire, &theirs_wire)?;
 
             let dest = out.unwrap_or(ours);
-            std::fs::write(&dest, merged_wire.as_bytes())?;
-
-            if let Some(ref mut v) = vault_opt {
-                let verified = parse_and_verify_wireframe(&subkeys, &path, &merged_wire)?;
-                let _ = v.append_audit_event(NewAuditEvent {
-                    operation: if has_conflict {
-                        "merge-conflict".to_string()
-                    } else {
-                        "merge-clean".to_string()
-                    },
-                    scope,
-                    rel_path: verified.norm_path,
-                    total_chunks: verified.chunks.len(),
-                    unchanged_chunks: 0,
-                    seal_short: verified.seal_hex[..16].to_string(),
-                });
-            }
-
+            let verified = parse_and_verify_wireframe(&subkeys, &path, &merged_wire)?;
+            let operation = if has_conflict {
+                "merge-conflict"
+            } else {
+                "merge-clean"
+            };
+            audit_output(vault_opt.as_mut(), operation, scope, verified, 0, || {
+                output::write_atomic(&dest, merged_wire.as_bytes())
+            })?;
             if has_conflict {
-                std::process::exit(1);
+                return Ok(ExitCode::from(1));
             }
         }
 
@@ -364,7 +400,7 @@ fn main() -> Result<()> {
             scope,
             key,
         } => {
-            let (repo_key, _) =
+            let (repo_key, mut vault) =
                 resolve_repo_key_and_vault(key.as_deref(), cli.vault, cli.keyring, &scope)?;
             let subkeys = repo_key.derive_subkeys()?;
             let wire_a = read_bounded_string(&file_a)?;
@@ -372,31 +408,50 @@ fn main() -> Result<()> {
             let stats = diff_wireframes_stats(&wire_a, &wire_b)?;
             let pt_a = smudge_from_wireframe(&subkeys, &path, &wire_a)?;
             let pt_b = smudge_from_wireframe(&subkeys, &path, &wire_b)?;
-            let a_str = String::from_utf8_lossy(&pt_a);
-            let b_str = String::from_utf8_lossy(&pt_b);
-            let patch = unified_diff_text(
+            let a_str = Zeroizing::new(String::from_utf8_lossy(&pt_a).into_owned());
+            let b_str = Zeroizing::new(String::from_utf8_lossy(&pt_b).into_owned());
+            check_text_budget(&a_str)?;
+            check_text_budget(&b_str)?;
+            let patch = Zeroizing::new(unified_diff_text(
                 &format!("a/{}", normalize_repo_path(&path)),
                 &a_str,
                 &format!("b/{}", normalize_repo_path(&path)),
                 &b_str,
-            );
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "stats": stats,
-                        "diff": patch,
-                    }))?
-                );
-            } else {
-                println!(
-                    "Chunk Reuse: {}/{} ({}%) | Changed: {}",
+            ));
+            let write = || {
+                let mut stdout = std::io::stdout().lock();
+                if cli.json {
+                    serde_json::to_writer_pretty(
+                        &mut stdout,
+                        &serde_json::json!({ "stats": stats, "diff": &*patch }),
+                    )?;
+                    stdout.write_all(b"\n")?;
+                } else {
+                    writeln!(
+                        stdout,
+                        "Chunk Reuse: {}/{} ({}%) | Changed: {}",
+                        stats.unchanged_chunks,
+                        stats.total_chunks_b,
+                        stats.reuse_pct,
+                        stats.changed_chunks_b
+                    )?;
+                    stdout.write_all(patch.as_bytes())?;
+                }
+                stdout.flush()?;
+                Ok(())
+            };
+            if let Some(vault) = vault.as_mut() {
+                let verified = parse_and_verify_wireframe(&subkeys, &path, &wire_b)?;
+                audit_output(
+                    Some(vault),
+                    "diff",
+                    scope,
+                    verified,
                     stats.unchanged_chunks,
-                    stats.total_chunks_b,
-                    stats.reuse_pct,
-                    stats.changed_chunks_b
-                );
-                print!("{patch}");
+                    write,
+                )?;
+            } else {
+                write()?;
             }
         }
 
@@ -406,89 +461,125 @@ fn main() -> Result<()> {
             scope,
             key,
         } => {
+            let (repo_key, mut vault) =
+                resolve_repo_key_and_vault(key.as_deref(), cli.vault, cli.keyring, &scope)?;
+            let subkeys = repo_key.derive_subkeys()?;
+            let wire = read_bounded_string(&file)?;
+            let verified = parse_and_verify_wireframe(&subkeys, &path, &wire)?;
+            let pt = smudge_from_wireframe(&subkeys, &path, &wire)?;
+            let count = verified.chunks.len();
+            audit_output(vault.as_mut(), "textconv", scope, verified, count, || {
+                write_bytes_arg(None, &pt)
+            })?;
+        }
+
+        Commands::VerifyTree {
+            dir,
+            manifest,
+            staged: _,
+            revision,
+            scope,
+            key,
+        } => {
             let (repo_key, _) =
                 resolve_repo_key_and_vault(key.as_deref(), cli.vault, cli.keyring, &scope)?;
             let subkeys = repo_key.derive_subkeys()?;
-            let raw = read_bounded_file(&file)?;
-            if is_vellum_wireframe(&raw) {
-                let wire = String::from_utf8(raw)?;
-                let pt = smudge_from_wireframe(&subkeys, &path, &wire)?;
-                std::io::stdout().write_all(&pt)?;
+            let result = if let Some(manifest) = manifest {
+                verify::verify_git(&dir, &manifest, revision.as_deref(), &subkeys)?
             } else {
-                std::io::stdout().write_all(&raw)?;
+                let mut files = Vec::new();
+                collect_tree_files(&dir, &mut files)?;
+                let mut result = verify::Verification::default();
+                for file in files {
+                    let path = file
+                        .strip_prefix(&dir)
+                        .ok()
+                        .and_then(|rel| {
+                            rel.iter()
+                                .map(|part| part.to_str())
+                                .collect::<Option<Vec<_>>>()
+                        })
+                        .map(|parts| parts.join("/"));
+                    let verified = (|| {
+                        let raw = read_bounded_file(&file)?;
+                        if !is_vellum_wireframe(&raw) {
+                            return Ok(false);
+                        }
+                        let path = path
+                            .as_deref()
+                            .context("cannot resolve a UTF-8 repository path")?;
+                        parse_and_verify_wireframe(&subkeys, path, std::str::from_utf8(&raw)?)?;
+                        Ok::<_, anyhow::Error>(true)
+                    })();
+                    match verified {
+                        Ok(true) => result.verified += 1,
+                        Ok(false) => result.skipped += 1,
+                        Err(error) => result.fail(file.display().to_string(), error),
+                    }
+                }
+                result
+            };
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "Verified: {} | Failed: {} | Skipped: {}",
+                    result.verified,
+                    result.failed.len(),
+                    result.skipped
+                );
+                if let Some(expected) = result.expected {
+                    println!("Expected protected Git paths: {expected}");
+                }
+                if let Some(source) = &result.git_source {
+                    println!("Git source: {source}");
+                }
+                for failure in &result.failed {
+                    eprintln!(
+                        "  [SEAL:FAIL] {}: {}",
+                        failure.file.escape_debug(),
+                        failure.error.escape_debug()
+                    );
+                }
+            }
+            if !result.passed() {
+                return Ok(ExitCode::FAILURE);
             }
         }
 
-        Commands::VerifyTree { dir, scope, key } => {
-            let (repo_key, _) =
-                resolve_repo_key_and_vault(key.as_deref(), cli.vault, cli.keyring, &scope)?;
-            let subkeys = repo_key.derive_subkeys()?;
-            let mut files = Vec::new();
-            collect_tree_files(&dir, &mut files)?;
-
-            let mut verified_count = 0usize;
-            let mut failed: Vec<(PathBuf, String)> = Vec::new();
-            for f in files {
-                let Ok(raw) = read_bounded_file(&f) else {
-                    continue;
-                };
-                if !is_vellum_wireframe(&raw) {
-                    continue;
-                }
-                let rel = f
-                    .strip_prefix(&dir)
-                    .unwrap_or(&f)
-                    .to_string_lossy()
-                    .to_string();
-                let Ok(wire) = String::from_utf8(raw) else {
-                    failed.push((f, "non-UTF8 wireframe".to_string()));
-                    continue;
-                };
-                match parse_and_verify_wireframe(&subkeys, &rel, &wire) {
-                    Ok(_) => verified_count += 1,
-                    Err(e) => failed.push((f, e.to_string())),
-                }
-            }
-
+        Commands::AuditVerify {
+            anchor_count,
+            anchor_head,
+        } => {
+            let vault = open_vault(cli.vault, cli.keyring, true)?;
+            let report = match (anchor_count, anchor_head) {
+                (Some(count), Some(head)) => vault.verify_audit_checkpoint(count, &head)?,
+                _ => vault.verify_audit_chain()?,
+            };
             if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "verified": verified_count,
-                        "failed": failed.iter().map(|(p, e)| serde_json::json!({"file": p, "error": e})).collect::<Vec<_>>(),
-                    }))?
-                );
+                println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!(
-                    "Verified Vellum files: {} | Failed seals: {}",
-                    verified_count,
-                    failed.len()
+                    "Verified audit entries: {} | Head: {}",
+                    report.total_entries, report.head_hash
                 );
-                for (p, err) in &failed {
-                    eprintln!("  [SEAL:FAIL] {}: {err}", p.display());
-                }
-            }
-
-            if !failed.is_empty() {
-                std::process::exit(1);
             }
         }
 
         Commands::GitConfig { scope } => {
             validate_scope_name(&scope)?;
+            let keyring_flag = if cli.keyring { " --keyring" } else { "" };
             println!("# .gitattributes");
-            println!("secret_notes/** filter=vellum diff=vellum merge=vellum\n");
+            println!("secret_notes/** filter=vellum merge=vellum -text\n");
             println!("# .git/config");
             println!("[filter \"vellum\"]");
-            println!("    clean = vellum clean --scope {scope} --path %f");
-            println!("    smudge = vellum smudge --scope {scope} --path %f");
+            println!("    clean = vellum{keyring_flag} clean --scope {scope} --path %f");
+            println!("    smudge = vellum{keyring_flag} smudge --scope {scope} --path %f");
             println!("    required = true");
-            println!("[diff \"vellum\"]");
-            println!("    textconv = vellum textconv --scope {scope} --path %f");
             println!("[merge \"vellum\"]");
             println!("    name = Vellum SIV 3-way encrypted merge driver");
             println!(
-                "    driver = vellum merge --scope {scope} --base %O --ours %A --theirs %B --path %P"
+                "    driver = vellum{keyring_flag} merge --scope {scope} --base %O --ours %A --theirs %B --path %P"
             );
         }
 
@@ -536,5 +627,5 @@ fn main() -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
