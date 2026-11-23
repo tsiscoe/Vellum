@@ -46,7 +46,7 @@ tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "net", "io-
 
 # TUI (Ratatui v0.30+ & Crossterm)
 ratatui = "0.30"
-crossterm = "0.28"
+crossterm = "0.29"
 
 # OS Keyring
 keyring = { version = "3.6", features = ["windows-native", "apple-native", "linux-native"] }
